@@ -25,10 +25,10 @@ from PySide6.QtCore import (QFileInfo, QFileSystemWatcher, QLockFile, QPointF,
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QCursor,
                            QDesktopServices, QFont, QFontMetrics, QIcon,
                            QImage, QPainter, QPainterPath, QPen, QPixmap)
-from PySide6.QtWidgets import (QApplication, QFileIconProvider, QMenu,
+from PySide6.QtWidgets import (QApplication, QFileDialog, QFileIconProvider, QMenu,
                                QMessageBox, QSystemTrayIcon, QWidget)
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 APP_NAME = "TaraDock"
 RELEASES_URL = "https://github.com/ProjectTara/TaraDock/releases"
 IS_WIN = sys.platform == "win32"
@@ -45,8 +45,10 @@ DEFAULTS = {
     "hide_taskbar": False,    # auto-hide taskbar Windows
     "show_running": True,     # tampilkan app berjalan yang tidak di-pin
     "autostart": False,
-    "order": [],              # urutan nama file .lnk
-    "hidden": [],             # .lnk yang disembunyikan dari dock
+    "mirror_taskbar": True,   # ikutkan pin taskbar Windows
+    "extra": [],              # item tambahan sendiri (path absolut)
+    "order": [],              # urutan: nama .lnk taskbar atau "own:<path>"
+    "hidden": [],             # .lnk taskbar yang disembunyikan dari dock
     "taskbar_prev_autohide": None,  # status asli taskbar, untuk dipulihkan
 }
 MAX_CONFIG_BYTES = 256 * 1024
@@ -72,6 +74,46 @@ def _name_list(value):
     return out
 
 
+MAX_EXTRA = 100
+SCRIPT_EXT = {".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh",
+              ".hta", ".msi", ".scr", ".reg", ".com", ".pif"}
+BAD_PATH_CHARS = set('"*?<>|') | {chr(i) for i in range(32)}
+
+
+def valid_path(v):
+    """Path absolut yang wajar untuk item dock buatan user."""
+    return (isinstance(v, str) and 3 <= len(v) <= 400 and os.path.isabs(v)
+            and not (set(v) & BAD_PATH_CHARS))
+
+
+def _path_list(value, limit=MAX_EXTRA):
+    out, seen = [], set()
+    if not isinstance(value, list):
+        return out
+    for v in value[:limit * 2]:
+        if valid_path(v) and norm(v) not in seen:
+            seen.add(norm(v))
+            out.append(v)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _order_list(value):
+    names = _name_list([v for v in value if isinstance(v, str) and not v.startswith("own:")]) \
+        if isinstance(value, list) else []
+    out = []
+    for v in (value if isinstance(value, list) else [])[:600]:
+        if not isinstance(v, str) or v in out:
+            continue
+        if v.startswith("own:"):
+            if valid_path(v[4:]):
+                out.append(v)
+        elif v in names:
+            out.append(v)
+    return out
+
+
 def sanitize(raw):
     cfg = dict(DEFAULTS)
     if not isinstance(raw, dict):
@@ -82,10 +124,12 @@ def sanitize(raw):
     v = raw.get("magnify")
     if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
         cfg["magnify"] = min(MAG_SCALES, key=lambda s: abs(s - v))
-    for k in ("autohide", "reserve_space", "hide_taskbar", "show_running", "autostart"):
+    for k in ("autohide", "reserve_space", "hide_taskbar", "show_running", "autostart",
+              "mirror_taskbar"):
         if isinstance(raw.get(k), bool):
             cfg[k] = raw[k]
-    cfg["order"] = _name_list(raw.get("order"))
+    cfg["extra"] = _path_list(raw.get("extra"))
+    cfg["order"] = _order_list(raw.get("order"))
     cfg["hidden"] = _name_list(raw.get("hidden"))
     v = raw.get("taskbar_prev_autohide")
     cfg["taskbar_prev_autohide"] = v if isinstance(v, bool) else None
@@ -469,11 +513,27 @@ def sort_pins(files, order, reg_pos):
     return sorted(files, key=key)
 
 
-class Item:
-    __slots__ = ("key", "name", "lnk", "target", "pinned", "hwnds", "icon")
+def order_key(it):
+    """Kunci urutan yang disimpan di config untuk item yang di-pin."""
+    return ("own:" + it.lnk) if it.own else os.path.basename(it.lnk)
 
-    def __init__(self, key, name, lnk, target, pinned):
+
+def apply_order(items, order):
+    """Urutkan item sesuai config; item baru tetap di posisi relatifnya (di akhir)."""
+    keys = []
+    for o in order:
+        keys.append(("own:" + norm(o[4:])) if o.startswith("own:") else ("pin:" + o.lower()))
+    pos = {k: i for i, k in enumerate(keys)}
+    return [it for _, it in sorted(enumerate(items),
+                                   key=lambda e: (pos.get(e[1].key, len(pos) + e[0]),))]
+
+
+class Item:
+    __slots__ = ("key", "name", "lnk", "target", "pinned", "hwnds", "icon", "own")
+
+    def __init__(self, key, name, lnk, target, pinned, own=False):
         self.key, self.name, self.lnk, self.target, self.pinned = key, name, lnk, target, pinned
+        self.own = own
         self.hwnds = []   # [(hwnd, title)] urut z-order
         self.icon = None
 
@@ -546,6 +606,7 @@ class Dock(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setMouseTracking(True)
+        self.setAcceptDrops(True)
         self.setWindowTitle(APP_NAME)
         self.cfg, self.cfg_dir, self.use_system = cfg, cfg_dir, use_system
         self.items, self.scales = [], []
@@ -712,12 +773,70 @@ class Dock(QWidget):
         self.icon_cache[path] = pm
         return pm
 
+    def own_item(self, path):
+        target = path
+        if path.lower().endswith(".lnk"):
+            info = QFileInfo(path)
+            target = info.symLinkTarget() if (info.isShortcut() or info.isSymLink()) else ""
+        if os.path.isdir(path):
+            target = ""  # folder: tidak dilacak status "berjalan"
+        name = os.path.basename(path.rstrip("\\/")) or path
+        if not os.path.isdir(path):
+            name = os.path.splitext(name)[0]
+        it = Item("own:" + norm(path), name, path, target, True, own=True)
+        shown = target if target and os.path.exists(target) else path
+        it.icon = self.icon_for(shown)
+        return it
+
+    def add_paths(self, paths, index=None, ask=True):
+        """Tambah file/folder/app ke dock. Return jumlah yang ditambahkan."""
+        added = []
+        existing = {norm(p) for p in self.cfg["extra"]}
+        existing |= {norm(it.target) for it in self.items if it.pinned and it.target}
+        existing |= {norm(it.lnk) for it in self.items if it.pinned and it.lnk}
+        for path in paths:
+            path = os.path.normpath(path)
+            if not valid_path(path) or not os.path.exists(path) or norm(path) in existing:
+                continue
+            if len(self.cfg["extra"]) + len(added) >= MAX_EXTRA:
+                QMessageBox.warning(None, APP_NAME, f"Maksimal {MAX_EXTRA} item tambahan.")
+                break
+            ext = os.path.splitext(path)[1].lower()
+            if ask and ext in SCRIPT_EXT:
+                r = QMessageBox.question(
+                    None, APP_NAME,
+                    f"{os.path.basename(path)} adalah script/installer.\n"
+                    "Klik di dock akan langsung menjalankannya. Tetap tambahkan?")
+                if r != QMessageBox.Yes:
+                    continue
+            added.append(path)
+            existing.add(norm(path))
+        if not added:
+            return 0
+        self.cfg["extra"].extend(added)
+        pins = [x for x in self.items if x.pinned]
+        keys = [order_key(x) for x in pins]
+        new_keys = ["own:" + p for p in added]
+        at = len(keys) if index is None else max(0, min(len(keys), index))
+        self.cfg["order"] = keys[:at] + new_keys + keys[at:]
+        self.save()
+        self.reload()
+        return len(added)
+
+    def remove_own(self, it):
+        self.cfg["extra"] = [p for p in self.cfg["extra"] if norm(p) != norm(it.lnk)]
+        self.cfg["order"] = [o for o in self.cfg["order"] if o != "own:" + it.lnk]
+        self.save()
+        self.reload()
+
     def reload(self):
         d = pinned_dir()
         try:
             files = [f for f in os.listdir(d) if f.lower().endswith(".lnk")
                      and os.path.isfile(os.path.join(d, f))]
         except OSError:
+            files = []
+        if not self.cfg["mirror_taskbar"]:
             files = []
         hidden = {h.lower() for h in self.cfg["hidden"]}
         files = [f for f in files if f.lower() not in hidden]
@@ -730,7 +849,13 @@ class Dock(QWidget):
             it = Item("pin:" + f.lower(), os.path.splitext(f)[0], lnk, target, True)
             it.icon = self.icon_for(target if target and os.path.exists(target) else lnk)
             pins.append(it)
-        self.items = pins
+        taken = {norm(x.target) for x in pins if x.target}
+        for path in self.cfg["extra"]:
+            it = self.own_item(path)
+            if it.target and norm(it.target) in taken:
+                continue  # sudah ada lewat pin taskbar
+            pins.append(it)
+        self.items = apply_order(pins, self.cfg["order"])
         self.refresh_running(force_layout=True)
 
     def refresh_running(self, force_layout=False):
@@ -804,13 +929,16 @@ class Dock(QWidget):
         if i == j:
             return
         pins.insert(j, pins.pop(i))
-        self.cfg["order"] = [os.path.basename(x.lnk) for x in pins]
+        self.cfg["order"] = [order_key(x) for x in pins]
         self.save()
         self.items = pins + [x for x in self.items if not x.pinned]
         self._recompute_base()
         self.update()
 
     def hide_item(self, it):
+        if it.own:
+            self.remove_own(it)
+            return
         name = os.path.basename(it.lnk)
         if name and name not in self.cfg["hidden"]:
             self.cfg["hidden"].append(name)
@@ -847,6 +975,49 @@ class Dock(QWidget):
             except Exception:
                 pass
         return False, 0
+
+    # --- drag & drop file / folder / shortcut ke dock
+    @staticmethod
+    def _drop_paths(mime):
+        if not mime.hasUrls():
+            return []
+        paths = [u.toLocalFile() for u in mime.urls()[:20] if u.isLocalFile()]
+        return [p for p in paths if p]
+
+    def dragEnterEvent(self, e):
+        if self._drop_paths(e.mimeData()):
+            self.hide_delay.stop()
+            self._set_reveal(1.0)
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
+        if self._drop_paths(e.mimeData()):
+            self.mouse = e.position()
+            self.hover = -1
+            self.anim.start()
+            e.acceptProposedAction()
+
+    def dragLeaveEvent(self, e):
+        self.leaveEvent(e)
+
+    def drop_index(self, x):
+        """Posisi sisip di antara item yang di-pin, berdasarkan x kursor."""
+        n_pins = sum(1 for it in self.items if it.pinned)
+        for i, c in enumerate(self.base_centers[:n_pins]):
+            if x < c:
+                return i
+        return n_pins
+
+    def dropEvent(self, e):
+        paths = self._drop_paths(e.mimeData())
+        idx = self.drop_index(e.position().x())
+        self.leaveEvent(e)
+        if paths:
+            e.acceptProposedAction()
+            # Tunda agar dialog konfirmasi tidak muncul di tengah operasi drag OLE.
+            QTimer.singleShot(0, lambda: self.add_paths(paths, idx))
 
     def mouseMoveEvent(self, e):
         self.mouse = e.position()
@@ -896,7 +1067,11 @@ class Dock(QWidget):
             m.addSeparator()
             m.addAction("Geser ke kiri", lambda: self.move_item(it, -1))
             m.addAction("Geser ke kanan", lambda: self.move_item(it, 1))
-            m.addAction("Sembunyikan dari dock", lambda: self.hide_item(it))
+            m.addAction("Hapus dari dock" if it.own else "Sembunyikan dari dock",
+                        lambda: self.hide_item(it))
+        elif it.target and os.path.isfile(it.target):
+            m.addSeparator()
+            m.addAction("Pin ke dock", lambda: self.add_paths([it.target], ask=False))
         path = it.target if it.target and os.path.exists(it.target) else it.lnk
         if path and os.path.exists(path) and '"' not in path:
             import subprocess
@@ -1057,6 +1232,8 @@ class Controller:
         save_config(self.cfg)
         if key == "show_running":
             self.dock.refresh_running(force_layout=True)
+        elif key == "mirror_taskbar":
+            self.dock.reload()
         else:
             self.dock.place()
         self.dock.update()
@@ -1088,12 +1265,15 @@ class Controller:
             m.addAction(a)
 
         m.addSeparator()
+        check("Ikutkan pin taskbar Windows", "mirror_taskbar")
         check("Sembunyikan dock otomatis", "autohide")
         check("Sisakan ruang untuk dock", "reserve_space")
         check("Tampilkan app berjalan (tidak di-pin)", "show_running")
         check("Sembunyikan taskbar Windows (auto-hide)", "hide_taskbar")
         check("Jalankan saat Windows mulai", "autostart")
         m.addSeparator()
+        m.addAction("Tambah app / file…", self.add_file)
+        m.addAction("Tambah folder…", self.add_folder)
         m.addAction("Muat ulang pin", self.dock.reload)
         self.unhide = m.addAction("Tampilkan lagi item tersembunyi", self.unhide_all)
         m.aboutToShow.connect(lambda: self.unhide.setEnabled(bool(self.cfg["hidden"])))
@@ -1102,6 +1282,21 @@ class Controller:
         m.addSeparator()
         m.addAction("Keluar", self.app.quit)
         return m
+
+    def add_file(self):
+        start = os.path.join(os.environ.get("ProgramData", ""), "Microsoft", "Windows",
+                             "Start Menu", "Programs")
+        paths, _ = QFileDialog.getOpenFileNames(
+            None, "Tambah ke dock", start if os.path.isdir(start) else "",
+            "App & shortcut (*.exe *.lnk *.url *.appref-ms);;Semua file (*)",
+            options=QFileDialog.DontResolveSymlinks)
+        if paths:
+            self.dock.add_paths(paths)
+
+    def add_folder(self):
+        path = QFileDialog.getExistingDirectory(None, "Tambah folder ke dock")
+        if path:
+            self.dock.add_paths([path])
 
     def unhide_all(self):
         self.cfg["hidden"] = []
@@ -1137,14 +1332,19 @@ def selftest(report_path):
     def t_sanitize():
         rnd = random.Random(7)
         junk = [None, 1, "x", [], {}, True, 1e309, -5, 999, [1, "a/b", "..", "ok.lnk"] * 200,
+                ["/abs/app.exe", "C:\\x\\y.exe", "own:/abs/app.exe", "own:rel", "own:" + "a" * 900,
+                 "/bad\x00", "/q\"uote"] * 50,
                 {"nested": {}}, "A" * 500, float("nan")]
         for _ in range(3000):
             raw = {k: rnd.choice(junk) for k in DEFAULTS if rnd.random() < 0.8}
             c = sanitize(raw)
             assert set(c) == set(DEFAULTS)
             assert c["icon_size"] in ICON_SIZES and c["magnify"] in MAG_SCALES
-            assert all(isinstance(x, str) and "/" not in x and "\\" not in x for x in c["order"])
-            assert len(c["order"]) <= 500
+            assert all(isinstance(x, str) for x in c["order"])
+            assert len(c["order"]) <= 600 and len(c["extra"]) <= MAX_EXTRA
+            assert all(valid_path(x) for x in c["extra"])
+            assert all(valid_path(x[4:]) if x.startswith("own:") else os.path.basename(x) == x
+                       for x in c["order"])
         return "3000 config acak OK"
 
     def t_config_io():
@@ -1191,6 +1391,45 @@ def selftest(report_path):
         d.render(img)
         return f"{checked} posisi kursor OK"
 
+    def t_own():
+        with tempfile.TemporaryDirectory() as d:
+            cfg = dict(DEFAULTS, mirror_taskbar=False, extra=[], order=[])
+            dock = Dock(cfg, cfg_dir=d, use_system=False)
+            files = []
+            for n in ("Alpha.exe", "Beta.lnk", "skrip.bat"):
+                fp = os.path.join(d, n)
+                with open(fp, "w") as f:
+                    f.write("x")
+                files.append(fp)
+            folder = os.path.join(d, "Proyek")
+            os.makedirs(folder)
+            assert dock.add_paths([files[0], folder], ask=False) == 2
+            assert dock.add_paths([files[0]], ask=False) == 0, "duplikat"
+            assert dock.add_paths([os.path.join(d, "tidak-ada.exe")], ask=False) == 0
+            assert dock.add_paths(["relatif.exe", "C:" + chr(0) + "x"], ask=False) == 0
+            assert dock.add_paths([files[1]], index=0, ask=False) == 1
+            assert [it.name for it in dock.items] == ["Beta", "Alpha", "Proyek"], \
+                [it.name for it in dock.items]
+            orig = QMessageBox.question
+            QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.No)
+            try:
+                assert dock.add_paths([files[2]]) == 0, "script ditolak tanpa konfirmasi"
+            finally:
+                QMessageBox.question = orig
+            dock.move_item(dock.items[2], -2)
+            assert [it.name for it in dock.items][0] == "Proyek"
+            again = load_config(d)
+            dock2 = Dock(again, cfg_dir=d, use_system=False)
+            dock2.reload()
+            assert [it.name for it in dock2.items] == ["Proyek", "Beta", "Alpha"], \
+                [it.name for it in dock2.items]
+            dock2.hide_item(dock2.items[1])
+            assert [it.name for it in dock2.items] == ["Proyek", "Alpha"]
+            assert len(load_config(d)["extra"]) == 2
+            dock2.apply_size()
+            assert dock2.drop_index(-1e9) == 0 and dock2.drop_index(1e9) == 2
+        return "tambah / duplikat / urutan / hapus / drop OK"
+
     def t_blob():
         names = ["Brave.lnk", "Telegram.lnk", "File Explorer.lnk", "Zed.lnk"]
         blob = b"\x00" * 10 + "telegram.lnk".encode("utf-16-le") + b"\x01" * 5 \
@@ -1220,7 +1459,8 @@ def selftest(report_path):
 
     app = QApplication.instance() or QApplication(sys.argv[:1])
     for name, fn in (("sanitize", t_sanitize), ("config_io", t_config_io),
-                     ("layout", t_layout), ("pin_order", t_blob), ("win32", t_win)):
+                     ("layout", t_layout), ("own_items", t_own), ("pin_order", t_blob),
+                     ("win32", t_win)):
         check(name, fn)
     del app
     report = {"version": __version__, "ok": ok, "results": results}

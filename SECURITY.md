@@ -4,6 +4,7 @@
 - Membaca shortcut di `%APPDATA%\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar` (pin taskbar milik user).
 - Membaca daftar jendela terbuka (judul + path exe) untuk titik "sedang berjalan". Data ini tidak disimpan dan tidak dikirim.
 - Menjalankan shortcut / exe yang diklik lewat `os.startfile`, tanpa shell dan tanpa argumen tambahan.
+- Item tambahan buatan user disimpan sebagai path absolut di config (maks 100). Script / installer (`.bat`, `.ps1`, `.msi`, dll.) butuh konfirmasi saat ditambahkan, karena klik di dock langsung menjalankannya.
 - Menyimpan pengaturan di `%APPDATA%\TaraDock\config.json`. Isi divalidasi; file rusak diganti default dan disimpan sebagai `config.json.bad`.
 
 ## Yang tidak dilakukan

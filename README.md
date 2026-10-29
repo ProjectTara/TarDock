@@ -3,7 +3,8 @@
 Dock ala macOS untuk Windows. App yang di-pin di taskbar tampil di bawah tengah layar.
 
 ## Fitur
-- Sinkron otomatis dengan pin taskbar Windows (pin / unpin langsung terlihat).
+- Sinkron otomatis dengan pin taskbar Windows (pin / unpin langsung terlihat). Bisa dimatikan.
+- Tambah item sendiri: drag file / folder / shortcut ke dock, menu tray **Tambah app / file…** / **Tambah folder…**, atau klik kanan app berjalan > **Pin ke dock**.
 - Magnifikasi saat hover (mati, 1.3x, 1.6x, 2.0x) dan label nama app.
 - Titik di bawah ikon untuk app yang sedang berjalan.
 - Klik: buka app; jika sudah terbuka, pindah ke jendelanya; klik lagi untuk minimize. Banyak jendela: klik berulang untuk berganti.
