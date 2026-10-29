@@ -28,14 +28,14 @@ from PySide6.QtGui import (QAction, QActionGroup, QColor, QCursor,
 from PySide6.QtWidgets import (QApplication, QFileIconProvider, QMenu,
                                QMessageBox, QSystemTrayIcon, QWidget)
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 APP_NAME = "TaraDock"
 RELEASES_URL = "https://github.com/ProjectTara/TaraDock/releases"
 IS_WIN = sys.platform == "win32"
 
 # ----------------------------------------------------------------- config
 
-ICON_SIZES = (40, 48, 56, 64, 72)
+ICON_SIZES = (24, 28, 32, 36, 40, 48, 56, 64, 72)
 MAG_SCALES = (1.0, 1.3, 1.6, 2.0)
 DEFAULTS = {
     "icon_size": 48,
