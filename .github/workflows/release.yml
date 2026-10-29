@@ -1,0 +1,126 @@
+# Build TaraDock.exe di Windows, uji, lalu terbitkan ke GitHub Releases.
+# Pemicu:
+#   - push tag vX.Y.Z  (git tag v1.0.0 && git push origin v1.0.0)
+#   - manual: tab Actions > "Build & Release" > Run workflow > isi versi
+# Versi harus sama dengan __version__ di taradock.py.
+name: Build & Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Versi rilis, contoh 1.0.0 (harus sama dengan __version__)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      # Action dipin ke commit SHA (tag bisa digeser, SHA tidak).
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependensi (versi dipin)
+        run: python -m pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Cek versi
+        id: ver
+        shell: pwsh
+        env:
+          # Input user lewat env, bukan disisipkan ke script (cegah injeksi).
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          $code = (python taradock.py --version).Trim()
+          if ($env:EVENT -eq 'push') { $want = $env:REF_NAME } else { $want = $env:INPUT_VERSION }
+          $want = $want.Trim().TrimStart('v')
+          if ($want -notmatch '^\d+\.\d+\.\d+$') { throw "Format versi salah: '$want'" }
+          if ($want -ne $code) { throw "Versi $want tidak sama dengan __version__ = $code" }
+          "version=$code" >> $env:GITHUB_OUTPUT
+
+      - name: Selftest (source)
+        run: python taradock.py --selftest selftest-source.json
+
+      - name: Build exe
+        run: >
+          python -m PyInstaller --noconfirm --clean --onefile --windowed
+          --name TaraDock --icon assets/taradock.ico
+          --add-data "assets/taradock.ico;assets"
+          --exclude-module tkinter
+          taradock.py
+
+      - name: Selftest (exe hasil build)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\TaraDock.exe -ArgumentList '--selftest','selftest-exe.json' -Wait -PassThru
+          if (Test-Path selftest-exe.json) { Get-Content selftest-exe.json }
+          if ($p.ExitCode -ne 0) { throw "Selftest exe gagal (exit $($p.ExitCode))" }
+
+      - name: Checksum SHA-256
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash dist\TaraDock.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  TaraDock.exe" | Out-File -Encoding ascii dist\SHA256SUMS.txt
+          Get-Content dist\SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: TaraDock
+          path: |
+            dist/TaraDock.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Izin tulis hanya di job ini; job build tidak pernah memegang token tulis.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: TaraDock
+          path: dist
+
+      # Bukti asal-usul: exe ini dibangun dari repo & commit ini.
+      # Cek: gh attestation verify TaraDock.exe --repo ProjectTara/TaraDock
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/TaraDock.exe
+
+      - name: Terbitkan rilis
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          gh release create "v${VERSION}" dist/TaraDock.exe dist/SHA256SUMS.txt \
+            --repo "$REPO" --target "$SHA" \
+            --title "TaraDock v${VERSION}" --generate-notes
